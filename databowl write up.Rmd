@@ -1,0 +1,547 @@
+
+---
+title: "Player and Team Evaluation in the NFL: Targeting and Play Success Prediction"
+author: "Ashleigh Prugh"
+output: html_document
+---
+
+## Paper on the NFL Prediction Models Using XGBoost
+
+### Abstract
+This paper presents a framework for predicting various outcomes in National Football League (NFL) games using machine learning models. Specifically, it utilizes XGBoost for pre-snap, post-snap, and play success predictions, with an emphasis on the interaction between offensive and defensive players and their impact on game outcomes. The framework incorporates multiple data transformations, including feature engineering, one-hot encoding, and cross-validation, to evaluate the models. Additionally, we explore the calibration of the predicted probabilities using the "iml" package to ensure the models are providing accurate probabilistic forecasts. The results demonstrate the applicability of machine learning models for NFL analytics, particularly in predicting the likelihood of pass targets and play success.
+
+### Introduction
+In the NFL, analyzing player performance and predicting game outcomes has evolved from basic statistics to advanced machine learning techniques. Football is a dynamic game with multiple moving parts, and the interaction between offensive and defensive players at various stages of the play is crucial for determining success. Traditional methods often fail to capture the complexity and nuances of these interactions. This paper seeks to bridge this gap by employing machine learning models, specifically XGBoost, to predict player behavior and overall play success in the NFL.
+
+The primary objectives of this research are:
+1. To predict whether a receiver will be targeted before and after the motion phase of a play.
+2. To predict the success of a play based on the likelihood of gaining positive expected points.
+3. To evaluate the model performance using appropriate metrics such as Root Mean Squared Error (RMSE).
+4. To assess model calibration to ensure reliable probabilistic predictions.
+
+The models developed in this paper are trained using a variety of features that describe both player positions and situational game data, and are evaluated using rigorous cross-validation techniques.
+
+### Data and Feature Engineering
+
+#### Data Preparation
+The dataset consists of player tracking data from NFL games, containing detailed information about each player's position, speed, and other attributes, as well as game-specific features like down, yards to go, and the score difference. The initial preparation process involves filtering missing values and calculating additional features, such as the relative distance between offensive and defensive players.
+
+```{r}
+# Data preparation function to calculate Euclidean distance and filter relevant columns
+library(dplyr)       # For data wrangling
+library(fastDummies) # For creating dummy variables
+library(xgboost)     # For XGBoost modeling
+library(iml)         # For interpreting machine learning models
+library(caret)       # For cross-validation and evaluation
+library(ggplot2)     # For plotting and visualizations
+library(arrow)       # For efficient data I/O
+library(data.table)  # For memory-efficient data processing
+library(Matrix)      # For sparse matrix conversion
+library(tidyr)       # For data tidying
+library(readr)
+
+prepare_data <- function(mismatch_data) {
+  mismatch_data <- mismatch_data %>%
+    filter(!is.na(wasTargettedReceiver)) %>%
+    mutate(relative_distance = sqrt(x_diff^2 + y_diff^2)) %>%
+    fastDummies::dummy_cols(mismatch_data, select_columns = c('offensive_position', 'primary_defensive_position'), remove_selected_columns = TRUE) %>%
+    fastDummies::dummy_cols(mismatch_data, select_columns = c('pff_passCoverage'), remove_selected_columns = TRUE) %>%
+    mutate(play_success = case_when(
+      expectedPointsAdded > 0 ~ 1,
+      TRUE ~ 0
+    )) %>%
+    select(frameId, gameId, playId, nflId, relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, wasTargettedReceiver, height_diff, weight_diff, expectedPointsAdded, yardsGained, motion_frame, ball_snap_frame, play_success, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
+  return(mismatch_data)
+}
+
+# Read and combine all datasets
+read_and_combine_datasets <- function(data_dir, weeks) {
+  files <- paste0(data_dir, "/prepared_data_week_", weeks, ".parquet")
+  combined_data <- bind_rows(lapply(files, read_parquet))
+  return(combined_data)
+}
+
+# Split data into training and testing sets
+split_data <- function(data, train_ratio = 0.8, seed = 42) {
+  set.seed(seed)
+  train_indices <- sample(1:nrow(data), size = train_ratio * nrow(data))
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  return(list(train = train_data, test = test_data))
+}
+```
+
+The dataset is filtered to remove instances where the target information is missing, and categorical variables (e.g., player positions, coverage schemes) are one-hot encoded. Additionally, the Euclidean distance between the offensive player and the defender is computed to capture the proximity of the players.
+
+#### Feature Selection
+Several features are selected based on their relevance to predicting whether a receiver will be targeted, the outcome of the play, and overall play success. These features include:
+- **Relative Distance**: The distance between the offensive player and the defender.
+- **Speed Differences**: The relative speed difference between the offensive player and the defender.
+- **Player Attributes**: Height and weight differences between the players.
+- **Game Context**: Information like down, yards to go, and game clock.
+- **Position Mismatches**: For example a wide receiver (WR) lines up against a linebacker (LB) in man-to-man coverage..
+
+### Model Development
+
+#### Pre-motion and Post-motion Models
+To predict the likelihood of a receiver being targeted, the dataset is divided into two phases: pre-motion (before the receiver starts moving) and post-motion (after the receiver begins motion but before the ball snap). For each phase, separate XGBoost models are trained. The objective is to predict whether a receiver will be targeted in these phases.
+
+```{r}
+# Training XGBoost model for pre-motion phase
+train_xgboost_model <- function(train_data) {
+  train_data <- train_data %>% filter(frameId < motion_frame)  # Filter for pre-motion phase
+  x_features_pre_motion <- train_data %>%
+    select(relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
+  dtrain <- xgb.DMatrix(data = as.matrix(x_features_pre_motion), label = train_data$wasTargettedReceiver)
+  params <- list(objective = 'binary:logistic', eval_metric = 'logloss', max_depth = 6, eta = 0.1, subsample = 0.8)
+  model <- xgboost(params = params, data = dtrain, nrounds = 100, verbose = 0)
+  return(model)
+}
+
+# Train post-motion model (XGBoost)
+train_post_motion_xgboost <- function(train_data) {
+  train_data <- train_data %>% filter(frameId > motion_frame & frameId < ball_snap_frame)  # Filter post-motion but before ball snap
+  
+  x_features_post_motion <- train_data %>% 
+    select(relative_distance, is_motion, speed_diff, max_speed_diff, distance_from_ball, 
+           x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, 
+           mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
+  
+  dtrain_post_motion <- xgb.DMatrix(data = as.matrix(x_features_post_motion), label = train_data$wasTargettedReceiver)
+  
+  params_post_motion <- list(objective = 'binary:logistic', eval_metric = 'logloss', max_depth = 6, eta = 0.1, subsample = 0.8)
+  model_post_motion <- xgboost(params = params_post_motion, data = dtrain_post_motion, nrounds = 100, verbose = 0)
+  
+  return(model_post_motion)
+}
+```
+
+The pre-motion model is trained on features like relative distance, speed difference, and game context (down, yards to go), while the post-motion model is trained on the same set of features but considers frames after the motion begins but before the ball snap.
+
+#### Play Success Model
+In addition to predicting receiver targeting, we also build a model to predict the success of the play. This model predicts whether the play will result in a positive expected points added (EPA).
+
+```{r}
+# Training play success model
+train_play_success_model <- function(train_data) {
+  train_data <- train_data %>%
+    filter(frameId < ball_snap_frame) %>%
+    filter(wasTargettedReceiver == 1) %>%
+    mutate(play_success = case_when(expectedPointsAdded > 0 ~ 1, TRUE ~ 0))
+  x_features_success <- train_data %>%
+    select(relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'), expectedPointsAdded, yardsGained)
+  dtrain_success <- xgb.DMatrix(data = as.matrix(x_features_success), label = train_data$play_success)
+  params_success <- list(objective = 'binary:logistic', eval_metric = 'logloss', max_depth = 6, eta = 0.1, subsample = 0.8)
+  model_success <- xgboost(params = params_success, data = dtrain_success, nrounds = 100, verbose = 0)
+  return(model_success)
+}
+
+# Function to predict pre-motion, post-motion, and play success probabilities
+predict_play_outcome <- function(model_pre_motion, model_post_motion, model_success, test_data) {
+  # Ensure consistent feature preparation
+  test_data <- test_data %>%
+    mutate(play_success = case_when(
+      expectedPointsAdded > 0 ~ 1,
+      TRUE ~ 0
+    ))
+  
+  # Pre-motion prediction
+  x_features_pre_motion <- test_data %>%
+    select(relative_distance, is_motion, speed_diff, max_speed_diff, distance_from_ball,
+           x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds,
+           mismatch, height_diff, weight_diff, starts_with("offensive_position_"), 
+           starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
+  dtest_pre_motion <- xgb.DMatrix(data = as.matrix(x_features_pre_motion))
+  pre_motion_preds <- predict(model_pre_motion, dtest_pre_motion)
+  
+  # Post-motion prediction
+  x_features_post_motion <- x_features_pre_motion
+  dtest_post_motion <- xgb.DMatrix(data = as.matrix(x_features_post_motion))
+  post_motion_preds <- predict(model_post_motion, dtest_post_motion)
+  
+  # Success prediction
+  x_features_success <- test_data %>%
+    select(relative_distance, is_motion, speed_diff, max_speed_diff, distance_from_ball,
+           x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds,
+           mismatch, height_diff, weight_diff, starts_with("offensive_position_"), 
+           starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'), expectedPointsAdded, yardsGained)
+  
+  dtest_success <- xgb.DMatrix(data = as.matrix(x_features_success))
+  success_preds <- predict(model_success, dtest_success)
+  
+  return(list(pre_motion_preds = pre_motion_preds, post_motion_preds = post_motion_preds, success_preds = success_preds))
+}
+
+```
+
+This model is trained on features that influence play success, including the expected points added and yards gained.
+
+### Model Evaluation
+
+#### RMSE Calculation
+To evaluate the performance of the models, we use the Root Mean Squared Error (RMSE) metric. This measure provides insight into the accuracy of the models' predictions, comparing the predicted probabilities against actual outcomes.
+
+```{r} 
+prepared_data <- read_csv('/Users/user/combined_data.csv') 
+
+# Step 3: Split into training and test sets
+splits <- split_data(prepared_data)
+train_data <- splits$train
+test_data <- splits$test
+
+# Step 4: Train models
+model_pre_motion <- train_xgboost_model(train_data)
+model_post_motion <- train_post_motion_xgboost(train_data)
+model_success <- train_play_success_model(train_data)
+
+# Step 5: Evaluate models on test data
+test_predictions <- predict_play_outcome(model_pre_motion, model_post_motion, model_success, test_data)
+
+# Function to calculate RMSE
+calculate_rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+# Calculate RMSE for evaluation
+rmse_pre_motion <- calculate_rmse(test_data$wasTargettedReceiver, test_predictions$pre_motion_preds)
+rmse_post_motion <- calculate_rmse(test_data$wasTargettedReceiver, test_predictions$post_motion_preds)
+rmse_play_success <- calculate_rmse(test_data$play_success, test_predictions$success_preds)
+
+# Print RMSE results
+rmse_results <- data.frame(
+  Model = c("Pre-Motion", "Post-Motion", "Play Success"),
+  RMSE = c(rmse_pre_motion, rmse_post_motion, rmse_play_success)
+)
+print(rmse_results)
+
+
+```
+
+#### Calibration Plot
+One of the challenges in predicting NFL outcomes is ensuring that the probabilities output by the model are well-calibrated. Using the "iml" package, we can plot the calibration curves to assess how well the predicted probabilities match the observed frequencies.
+
+```{r}
+# Calibration plot
+library(iml)
+predictor <- Predictor$new(model = model_success, data = test_data, y = test_data$play_success)
+calibration <- Calibration$new(predictor)
+calibration$plot()
+```
+
+This plot allows analysts to visually inspect whether the predicted probabilities of play success align with the actual success rates.
+
+### Results and Discussion
+
+#### Model Performance
+After training and evaluating the models, we report the RMSE values for the pre-motion, post-motion, and play success models. These values provide an indication of the model's ability to predict targeted receivers and play outcomes with high accuracy.
+
+```{r}
+cat("RMSE for pre-snap model:", rmse_pre_motion, "\n")
+cat("RMSE for post-snap model:", rmse_post_motion, "\n")
+cat("RMSE for play success model:", rmse_success, "\n")
+```
+
+#### Model Viz 
+
+```{r} 
+# Load necessary libraries
+library(dplyr)
+library(arrow)
+library(ggplot2)
+library(gganimate)
+library(xgboost)
+library(fastDummies)
+library(data.table)
+
+# Assuming the models are already trained (from previous code)
+
+# 1. Filter for a Specific Play (e.g., gameId = 2021090900, playId = 75)
+game_id <- 2022091200  # Example gameId
+play_id <- 346          # Example playId
+
+tracking <- fread("/Users/user/Desktop/data bowl 2025/tracking_week_1.csv") #, select = c("gameId", "playId", "nflId", "x", "y", "s", "dis", "o", "dir", "event", "position"))
+
+
+# Filter the dataset to the specific play
+play_data <- prepared_data %>%  
+  filter(gameId == game_id, playId == play_id)
+
+tracking <- tracking %>%  
+  select(gameId, playId, frameId, nflId, x, y, s, a, o, dir) %>%  
+  filter(gameId == game_id, playId == play_id)
+
+library(dplyr)
+
+players <- read.csv('/Users/user/Desktop/data bowl 2025/players.csv')
+
+
+# Join for offensive nflId
+play_data_offense <- play_data %>% 
+  filter(!is.na(off_nflId)) %>% 
+  rename(nflId = off_nflId) 
+
+
+play_data <- left_join(tracking, play_data_offense, by= c('gameId', 'playId', 'frameId', 'nflId'))
+
+play_data <- left_join(play_data, players, by = c('nflId'))
+
+
+
+
+# 2. Prepare the data for prediction
+# Pre-motion predictions
+x_features_pre_motion <- play_data %>%  
+  select(relative_distance, is_motion, speed_diff, max_speed_diff, distance_from_ball,
+         x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds,
+         mismatch, height_diff, weight_diff, starts_with("offensive_position_"),  
+         starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
+dtest_pre_motion <- xgb.DMatrix(data = as.matrix(x_features_pre_motion))
+pre_motion_preds <- predict(model_pre_motion, dtest_pre_motion)
+
+# Post-motion predictions
+x_features_post_motion <- x_features_pre_motion
+dtest_post_motion <- xgb.DMatrix(data = as.matrix(x_features_post_motion))
+post_motion_preds <- predict(model_post_motion, dtest_post_motion)
+
+# Success predictions
+x_features_success <- play_data %>%
+  select(relative_distance, is_motion, speed_diff, max_speed_diff, distance_from_ball,
+         x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds,
+         mismatch, height_diff, weight_diff, starts_with("offensive_position_"),  
+         starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'), expectedPointsAdded, yardsGained)
+dtest_success <- xgb.DMatrix(data = as.matrix(x_features_success))
+success_preds <- predict(model_success, dtest_success)
+
+# Add the predictions (probabilities) to the play data
+play_data <- play_data %>%
+  mutate(pre_motion_prob = pre_motion_preds,
+         post_motion_prob = post_motion_preds,
+         play_success_prob = success_preds) 
+
+play_data <- left_join(play_data, players, by = c('nflId'))
+
+# 3. Create the Football Field Plot for Animation
+create_field <- function() {
+  ggplot() +
+    geom_rect(aes(xmin = 0, xmax = 120, ymin = 0, ymax = 53.3), fill = "#006400") +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linetype = "dashed") +
+    geom_hline(yintercept = c(0, 53.3), color = "white") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+      axis.ticks = element_blank()
+    )
+}
+
+animation <- create_field() + 
+  # Players: Color them by pre-motion probability, but grey out those with NA in offensive_position_ columns
+  geom_point(data = play_data %>% filter(!is.na(nflId)), aes(x = x, y = y, color = pre_motion_prob), size = 3) + 
+  geom_point(data = play_data %>%
+               mutate(
+                 all_na_or_zero_in_positions = rowSums(
+                   !is.na(select(., starts_with("offensive_position_"))) & 
+                     select(., starts_with("offensive_position_")) != 0
+                 ) == 0  # Check if all values are either NA or 0
+               ) %>%
+               filter(all_na_or_zero_in_positions),
+             aes(x = x, y = y), color = "grey", size = 3) + 
+  geom_text(data = play_data %>% 
+              filter(!is.na(nflId), pre_motion_prob > 0.16),  # Add filter for pre_motion_prob > 0
+            aes(x = x, y = y, label = sprintf("%.2f", pre_motion_prob)), 
+            color = "white", size = 3, vjust = -1) +  # Display probability as text for players
+  geom_text(data = play_data %>% 
+              filter(!is.na(nflId), pre_motion_prob > 0.16),  # Add filter for pre_motion_prob > 0
+            aes(x = x, y = y, label = displayName), 
+            color = "black", size = 3, vjust = 1.5) +  # Add player names below the points
+  # Ball: Rows with NA in nflId correspond to the ball
+  geom_point(data = play_data %>% filter(is.na(nflId)), aes(x = x, y = y), color = "orange", size = 3, shape = 16) + 
+  scale_color_gradient(low = "blue", high = "red") + 
+  labs(title = paste("Play Animation | Game: ", game_id, " | Play: ", play_id, " | Frame: {frameId}"),
+       subtitle = "Pre-Motion Target Probability", 
+       color = "Target Probability") + 
+  transition_states(frameId, transition_length = 1, state_length = 1) + 
+  ease_aes('linear')
+
+
+# Save the Animation as a GIF
+animate(animation, width = 800, height = 400, fps = 10, renderer = gifski_renderer("play_animation_with_names.gif"))
+
+# Optionally display the animation in the console
+animate(animation, width = 800, height = 400, fps = 10)
+
+
+
+```
+
+### Adding Team and Player Evaluations to NFL Prediction Models
+
+Building upon the previous work that involves predicting receiver targeting and play success, we can extend the models to evaluate individual players and teams. Player and team evaluations are critical in NFL analytics for assessing player performance, strategy effectiveness, and identifying strengths and weaknesses during a game. Using the model outputs, we can generate performance metrics for individual players and teams, which can provide actionable insights for coaches, analysts, and teams themselves.
+
+In this section, we describe how to leverage the pre-motion, post-motion, and play success models to evaluate players and teams using a structured workflow. We also provide the necessary R code to implement these evaluations based on the outputs of the aforementioned models.
+
+---
+
+### 1. **Player Evaluation**
+
+To evaluate individual player performance, we focus on two main aspects:
+- **Targeting and Receiving Evaluation:** How frequently a player is targeted as a receiver, and the probability of being targeted at different points of the play.
+- **Play Success Evaluation:** The likelihood that a player's involvement in a play results in a successful outcome, considering the overall game context (e.g., expected points added).
+
+#### 1.1 Targeting Evaluation
+
+To evaluate how frequently a player is targeted, we can use the probabilities from the pre-motion and post-motion models. The pre-motion model gives us the likelihood of a player being targeted before the motion phase, while the post-motion model gives the likelihood of being targeted during or after the motion.
+
+We can compute a **targeting score** for each player, which represents the average probability of being targeted at various stages of the play.
+
+```{r}
+# Function to evaluate player targeting
+evaluate_player_targeting <- function(test_data, model_pre_motion, model_post_motion) {
+  # Extract the features required for prediction (same as before)
+  x_features_pre_motion <- test_data %>%
+    select(relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
+  
+  dtest_pre_motion <- xgb.DMatrix(data = as.matrix(x_features_pre_motion))
+  pre_motion_preds <- predict(model_pre_motion, dtest_pre_motion)
+  
+  # Post-motion prediction
+  x_features_post_motion <- x_features_pre_motion
+  dtest_post_motion <- xgb.DMatrix(data = as.matrix(x_features_post_motion))
+  post_motion_preds <- predict(model_post_motion, dtest_post_motion)
+  
+  # Combine predictions into one data frame
+  player_targeting <- test_data %>%
+    mutate(pre_motion_target_prob = pre_motion_preds,
+           post_motion_target_prob = post_motion_preds) %>%
+    group_by(nflId) %>%
+    summarise(target_prob_pre_motion = mean(pre_motion_target_prob, na.rm = TRUE),
+              target_prob_post_motion = mean(post_motion_target_prob, na.rm = TRUE))
+  
+  return(player_targeting)
+}
+```
+
+This function calculates the average targeting probability for each player before and after motion. These values can be interpreted as a "targeting score," which represents how likely a player is to be targeted at different points during the play.
+
+#### 1.2 Play Success Evaluation
+
+The play success model predicts whether the play will be successful (i.e., positive expected points added). To evaluate player performance in terms of play success, we compute the **play success score** for each player, which is based on the probability that a player’s involvement leads to a successful play.
+
+```{r}
+# Function to evaluate player play success
+evaluate_player_play_success <- function(test_data, model_success) {
+  # Use the same features as the play success model for prediction
+  x_features_success <- test_data %>%
+    select(relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'), expectedPointsAdded, yardsGained)
+  
+  dtest_success <- xgb.DMatrix(data = as.matrix(x_features_success))
+  success_preds <- predict(model_success, dtest_success)
+  
+  # Combine success predictions into a summary for each player
+  player_success <- test_data %>%
+    mutate(play_success_prob = success_preds) %>%
+    group_by(nflId) %>%
+    summarise(play_success_prob_avg = mean(play_success_prob, na.rm = TRUE))
+  
+  return(player_success)
+}
+```
+
+This function generates a **play success probability** for each player based on their actions during the play. The higher the probability, the more likely the player's actions contributed to a successful play.
+
+---
+
+### 2. **Team Evaluation**
+
+Team evaluation involves aggregating player-level metrics to understand how a team performs at a higher level. We can compute team performance metrics based on two key aspects:
+- **Team Targeting:** The average targeting probability for all players on the team.
+- **Team Play Success:** The average play success probability for all players on the team.
+
+In addition to individual player evaluations, aggregating these metrics at the team level provides a holistic understanding of team performance. Team evaluation is useful for assessing overall team strategy, identifying areas for improvement, and comparing teams.
+
+#### 2.1 Team Targeting Evaluation
+
+To evaluate team targeting, we aggregate the individual targeting probabilities across all players for each team.
+
+```{r}
+# Function to evaluate team targeting
+evaluate_team_targeting <- function(player_targeting, player_data) {
+  # Merge player-level targeting probabilities with player team data
+  team_targeting <- player_targeting %>%
+    left_join(player_data, by = "nflId") %>%
+    group_by(teamAbbr) %>%
+    summarise(team_target_prob_pre_motion = mean(target_prob_pre_motion, na.rm = TRUE),
+              team_target_prob_post_motion = mean(target_prob_post_motion, na.rm = TRUE))
+  
+  return(team_targeting)
+}
+```
+
+This function computes the average targeting probabilities for each team based on individual player performances, both before and after motion.
+
+#### 2.2 Team Play Success Evaluation
+
+Similarly, we aggregate the individual play success probabilities to compute a team-level play success score.
+
+```{r}
+# Function to evaluate team play success
+evaluate_team_play_success <- function(player_success, player_data) {
+  # Merge player-level play success probabilities with player team data
+  team_play_success <- player_success %>%
+    left_join(player_data, by = "nflId") %>%
+    group_by(teamAbbr) %>%
+    summarise(team_play_success_prob = mean(play_success_prob_avg, na.rm = TRUE))
+  
+  return(team_play_success)
+}
+```
+
+This function aggregates the individual play success probabilities for all players within a team to calculate a team-level play success score.
+
+---
+
+### 3. **Putting It All Together**
+
+Using the above evaluation functions, we can create a comprehensive performance report for both individual players and teams. The workflow is as follows:
+
+1. **Prepare Data**: Clean and preprocess the data (as described in the original workflow).
+2. **Train Models**: Train the pre-motion, post-motion, and play success models.
+3. **Evaluate Player Performance**: Use the targeting and play success models to compute player-level evaluation metrics (targeting score and play success score).
+4. **Evaluate Team Performance**: Aggregate player-level evaluations to compute team-level metrics (team targeting and team play success).
+
+```{r}
+# Assuming 'test_data' and 'player_data' are available (player-level information like team abbreviation, player IDs)
+player_targeting <- evaluate_player_targeting(test_data, model_pre_motion, model_post_motion)
+player_success <- evaluate_player_play_success(test_data, model_success)
+
+# Aggregating player-level metrics for team evaluation
+team_targeting <- evaluate_team_targeting(player_targeting, player_data)
+team_play_success <- evaluate_team_play_success(player_success, player_data)
+
+# Output the results
+print("Player Targeting Scores:")
+print(player_targeting)
+
+print("Player Play Success Scores:")
+print(player_success)
+
+print("Team Targeting Scores:")
+print(team_targeting)
+
+print("Team Play Success Scores:")
+print(team_play_success)
+```
+
+### Conclusion
+
+By extending the machine learning models to include player and team evaluations, we provide a comprehensive framework for NFL performance analytics. This approach not only allows for individual player performance assessments but also aggregates those metrics to evaluate team strategies and overall effectiveness. 
+
+The combination of pre-motion, post-motion, and play success predictions offers a dynamic view of a player's and team's likelihood of success at various stages of a play. This framework can be adapted to different stages of a game, different positions, and various other football analytics tasks, providing a robust toolset for NFL analysts, coaches, and decision-makers.
+
+Future improvements could include incorporating more complex features, such as player fatigue, defensive schemes, and real-time game situations, to further enhance the accuracy of the models and evaluations.
+
+### Conclusion
+This paper demonstrates the potential of machine learning techniques, specifically XGBoost, in NFL analytics. By predicting receiver targeting and play success, we can provide valuable insights for coaches, analysts, and fans alike. Furthermore, the calibration and evaluation techniques used ensure that the predictions are both accurate and reliable, offering a robust framework for NFL play prediction.
+
+Future work could explore incorporating additional features, such as player fatigue or weather conditions, and refine the models by experimenting with other machine learning algorithms. The approach outlined in this paper sets a foundation for the deeper integration of AI in sports analytics, helping
