@@ -398,11 +398,8 @@ top_players <- prepared_data %>%
 
 top_players <- left_join(top_players, players, by = c('off_nflId' = 'nflId')) 
 
-top_players_te <- top_players %>% 
+top_players <- top_players %>% 
   filter(position == 'TE')
-
-top_players_wr <- top_players %>% 
-filter(position == 'WR')
 
 print(top_players) 
 
