@@ -385,119 +385,65 @@ In this section, we describe how to leverage the pre-motion, post-motion, and pl
 
 ### 1. **Player Evaluation**
 
-To evaluate individual player performance, we focus on two main aspects:
-- **Targeting and Receiving Evaluation:** How frequently a player is targeted as a receiver, and the probability of being targeted at different points of the play.
-- **Play Success Evaluation:** The likelihood that a player's involvement in a play results in a successful outcome, considering the overall game context (e.g., expected points added).
+```{r} 
+# Top-performing players by mismatch
+top_players <- prepared_data %>%
+  group_by(off_nflId) %>% 
+  summarise(
+    total_success = mean(play_success, na.rm = TRUE),
+    avg_epa = mean(expectedPointsAdded, na.rm = TRUE),
+    mismatch_count = n()
+  ) %>%
+  arrange(desc(total_success))
 
-#### 1.1 Targeting Evaluation
+top_players <- left_join(top_players, players, by = c('off_nflId' = 'nflId')) 
 
-To evaluate how frequently a player is targeted, we can use the probabilities from the pre-motion and post-motion models. The pre-motion model gives us the likelihood of a player being targeted before the motion phase, while the post-motion model gives the likelihood of being targeted during or after the motion.
+top_players_te <- top_players %>% 
+  filter(position == 'TE')
 
-We can compute a **targeting score** for each player, which represents the average probability of being targeted at various stages of the play.
+top_players_wr <- top_players %>% 
+filter(position == 'WR')
 
-```{r}
-# Function to evaluate player targeting
-evaluate_player_targeting <- function(test_data, model_pre_motion, model_post_motion) {
-  # Extract the features required for prediction (same as before)
-  x_features_pre_motion <- test_data %>%
-    select(relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'))
-  
-  dtest_pre_motion <- xgb.DMatrix(data = as.matrix(x_features_pre_motion))
-  pre_motion_preds <- predict(model_pre_motion, dtest_pre_motion)
-  
-  # Post-motion prediction
-  x_features_post_motion <- x_features_pre_motion
-  dtest_post_motion <- xgb.DMatrix(data = as.matrix(x_features_post_motion))
-  post_motion_preds <- predict(model_post_motion, dtest_post_motion)
-  
-  # Combine predictions into one data frame
-  player_targeting <- test_data %>%
-    mutate(pre_motion_target_prob = pre_motion_preds,
-           post_motion_target_prob = post_motion_preds) %>%
-    group_by(nflId) %>%
-    summarise(target_prob_pre_motion = mean(pre_motion_target_prob, na.rm = TRUE),
-              target_prob_post_motion = mean(post_motion_target_prob, na.rm = TRUE))
-  
-  return(player_targeting)
-}
+print(top_players) 
+
 ```
 
-This function calculates the average targeting probability for each player before and after motion. These values can be interpreted as a "targeting score," which represents how likely a player is to be targeted at different points during the play.
-
-#### 1.2 Play Success Evaluation
-
-The play success model predicts whether the play will be successful (i.e., positive expected points added). To evaluate player performance in terms of play success, we compute the **play success score** for each player, which is based on the probability that a player’s involvement leads to a successful play.
-
-```{r}
-# Function to evaluate player play success
-evaluate_player_play_success <- function(test_data, model_success) {
-  # Use the same features as the play success model for prediction
-  x_features_success <- test_data %>%
-    select(relative_distance, is_motion, speed_diff, distance_from_ball, x_diff, y_diff, down, yardsToGo, score_diff, gameClock_seconds, mismatch, height_diff, weight_diff, starts_with("offensive_position_"), starts_with("primary_defensive_position_"), starts_with('pff_passCoverage_'), expectedPointsAdded, yardsGained)
+```{r} 
+# Calculate pre-snap motion usage and target probability by team
+calculate_motion_effectiveness <- function(data, pre_motion_preds) {
+  data <- data %>%
+    mutate(pre_snap_motion_used = ifelse(is_motion == 1, 1, 0)) %>%
+    group_by(possessionTeam) %>%
+    summarise(
+      total_plays = n(),
+      motion_plays = sum(pre_snap_motion_used),
+      motion_target_rate = mean(pre_motion_preds[pre_snap_motion_used == 1]),
+      motion_usage_rate = mean(pre_snap_motion_used)
+    )
   
-  dtest_success <- xgb.DMatrix(data = as.matrix(x_features_success))
-  success_preds <- predict(model_success, dtest_success)
+  data <- data %>%
+    mutate(motion_effectiveness = motion_target_rate * motion_usage_rate) # Define effectiveness as motion target rate weighted by usage rate
   
-  # Combine success predictions into a summary for each player
-  player_success <- test_data %>%
-    mutate(play_success_prob = success_preds) %>%
-    group_by(nflId) %>%
-    summarise(play_success_prob_avg = mean(play_success_prob, na.rm = TRUE))
-  
-  return(player_success)
+  return(data)
 }
+
+plays <- read.csv('/Users/user/Desktop/data bowl 2025/plays.csv')
+
+
+test_data <- left_join(test_data, plays, by = c('gameId', 'playId'))
+
+# Apply this function to the dataset
+motion_effectiveness <- calculate_motion_effectiveness(test_data, test_predictions$pre_motion_preds)
+
+# Sort teams by motion effectiveness
+motion_effectiveness_sorted <- motion_effectiveness %>%
+  arrange(desc(motion_effectiveness))
+
+# Display top teams with highest motion effectiveness
+head(motion_effectiveness_sorted)
+
+
 ```
-
-This function generates a **play success probability** for each player based on their actions during the play. The higher the probability, the more likely the player's actions contributed to a successful play.
-
----
-
-### 2. **Team Evaluation**
-
-Team evaluation involves aggregating player-level metrics to understand how a team performs at a higher level. We can compute team performance metrics based on two key aspects:
-- **Team Targeting:** The average targeting probability for all players on the team.
-- **Team Play Success:** The average play success probability for all players on the team.
-
-In addition to individual player evaluations, aggregating these metrics at the team level provides a holistic understanding of team performance. Team evaluation is useful for assessing overall team strategy, identifying areas for improvement, and comparing teams.
-
-#### 2.1 Team Targeting Evaluation
-
-To evaluate team targeting, we aggregate the individual targeting probabilities across all players for each team.
-
-```{r}
-# Function to evaluate team targeting
-evaluate_team_targeting <- function(player_targeting, player_data) {
-  # Merge player-level targeting probabilities with player team data
-  team_targeting <- player_targeting %>%
-    left_join(player_data, by = "nflId") %>%
-    group_by(teamAbbr) %>%
-    summarise(team_target_prob_pre_motion = mean(target_prob_pre_motion, na.rm = TRUE),
-              team_target_prob_post_motion = mean(target_prob_post_motion, na.rm = TRUE))
-  
-  return(team_targeting)
-}
-```
-
-This function computes the average targeting probabilities for each team based on individual player performances, both before and after motion.
-
-#### 2.2 Team Play Success Evaluation
-
-Similarly, we aggregate the individual play success probabilities to compute a team-level play success score.
-
-```{r}
-# Function to evaluate team play success
-evaluate_team_play_success <- function(player_success, player_data) {
-  # Merge player-level play success probabilities with player team data
-  team_play_success <- player_success %>%
-    left_join(player_data, by = "nflId") %>%
-    group_by(teamAbbr) %>%
-    summarise(team_play_success_prob = mean(play_success_prob_avg, na.rm = TRUE))
-  
-  return(team_play_success)
-}
-```
-
-This function aggregates the individual play success probabilities for all players within a team to calculate a team-level play success score.
 
 ---
 
@@ -540,8 +486,3 @@ By extending the machine learning models to include player and team evaluations,
 The combination of pre-motion, post-motion, and play success predictions offers a dynamic view of a player's and team's likelihood of success at various stages of a play. This framework can be adapted to different stages of a game, different positions, and various other football analytics tasks, providing a robust toolset for NFL analysts, coaches, and decision-makers.
 
 Future improvements could include incorporating more complex features, such as player fatigue, defensive schemes, and real-time game situations, to further enhance the accuracy of the models and evaluations.
-
-### Conclusion
-This paper demonstrates the potential of machine learning techniques, specifically XGBoost, in NFL analytics. By predicting receiver targeting and play success, we can provide valuable insights for coaches, analysts, and fans alike. Furthermore, the calibration and evaluation techniques used ensure that the predictions are both accurate and reliable, offering a robust framework for NFL play prediction.
-
-Future work could explore incorporating additional features, such as player fatigue or weather conditions, and refine the models by experimenting with other machine learning algorithms. The approach outlined in this paper sets a foundation for the deeper integration of AI in sports analytics, helping
